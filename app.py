@@ -7,30 +7,37 @@ import io
 
 app = FastAPI()
 
-# ===== Request Schema =====
 class AudioRequest(BaseModel):
     audio_id: str
     audio_base64: str
 
 
-# ===== Feature Extraction =====
-def extract_features(y, sr):
-    features = {}
+# ===== SAFE ROUNDING =====
+def r(x):
+    return float(np.round(x, 6))
 
-    # MFCC
+
+# ===== FEATURE EXTRACTION (DETERMINISTIC) =====
+def extract_features(y, sr):
+    # Fix length for consistency
+    y = librosa.util.fix_length(y, size=22050)
+
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
 
-    for i in range(mfcc.shape[0]):
+    features = {}
+    for i in range(13):
         features[f"mfcc_{i}"] = mfcc[i]
 
     return features
 
 
-# ===== Statistics Function =====
+# ===== STATS =====
 def compute_stats(features):
+    keys = sorted(features.keys())  # FIXED ORDER
+
     result = {
-        "rows": 0,
-        "columns": [],
+        "rows": len(keys),
+        "columns": keys,
         "mean": {},
         "std": {},
         "variance": {},
@@ -44,54 +51,57 @@ def compute_stats(features):
         "correlation": []
     }
 
-    for key, values in features.items():
-        values = np.array(values)
+    matrix = []
 
-        result["columns"].append(key)
-        result["mean"][key] = float(np.mean(values))
-        result["std"][key] = float(np.std(values))
-        result["variance"][key] = float(np.var(values))
-        result["min"][key] = float(np.min(values))
-        result["max"][key] = float(np.max(values))
-        result["median"][key] = float(np.median(values))
+    for key in keys:
+        v = np.array(features[key], dtype=np.float64)
 
-        # Mode (safe)
-        try:
-            vals, counts = np.unique(values, return_counts=True)
-            result["mode"][key] = float(vals[np.argmax(counts)])
-        except:
-            result["mode"][key] = 0.0
+        result["mean"][key] = r(np.mean(v))
+        result["std"][key] = r(np.std(v))
+        result["variance"][key] = r(np.var(v))
+        result["min"][key] = r(np.min(v))
+        result["max"][key] = r(np.max(v))
+        result["median"][key] = r(np.median(v))
 
-        result["range"][key] = float(np.max(values) - np.min(values))
+        # STABLE MODE (rounded first)
+        vr = np.round(v, 3)
+        vals, counts = np.unique(vr, return_counts=True)
+        result["mode"][key] = r(vals[np.argmax(counts)])
 
-        # Extra required keys
+        result["range"][key] = r(np.max(v) - np.min(v))
         result["allowed_values"][key] = []
-        result["value_range"][key] = [float(np.min(values)), float(np.max(values))]
+        result["value_range"][key] = [r(np.min(v)), r(np.max(v))]
 
-    result["rows"] = len(features)
+        matrix.append(v)
+
+    # ===== CORRELATION (SAFE) =====
+    try:
+        corr = np.corrcoef(matrix)
+        corr = np.nan_to_num(corr)
+
+        result["correlation"] = [
+            [r(val) for val in row] for row in corr
+        ]
+    except:
+        result["correlation"] = []
 
     return result
 
 
-# ===== API Endpoint =====
 @app.post("/predict")
 def predict(req: AudioRequest):
     try:
-        # Decode base64
         audio_bytes = base64.b64decode(req.audio_base64)
 
-        # Load audio
-        y, sr = librosa.load(io.BytesIO(audio_bytes), sr=None)
+        y, sr = librosa.load(io.BytesIO(audio_bytes), sr=22050)
 
-        # Extract features
         features = extract_features(y, sr)
-
-        # Compute stats
         result = compute_stats(features)
 
         return result
 
-    except Exception as e:
+    except Exception:
+        # STRICT EMPTY RESPONSE
         return {
             "rows": 0,
             "columns": [],
